@@ -1,0 +1,9 @@
+[submodule "appointment-service"]
+	path = appointment-service
+	url = https://github.com/lihiniapsara/smart-clinic-appointment-service.git
+[submodule "doctor-service"]
+	path = doctor-service
+	url = https://github.com/lihiniapsara/smart-clinic-doctor-service.git
+[submodule "patient-service"]
+	path = patient-service
+	url = https://github.com/lihiniapsara/smart-clinic-patient-service.git

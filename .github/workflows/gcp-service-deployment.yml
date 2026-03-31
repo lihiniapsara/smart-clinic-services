@@ -1,0 +1,99 @@
+name: Deploy Services to GCP
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    name: Build and Deploy Services
+    runs-on: ubuntu-latest
+
+    env:
+      PROJECT_ID: ${{ secrets.GCP_PROJECT_ID }}
+      REGION: us-central1
+      MIG_NAME: smartclinic-services-mig
+      VM_USER: gcp-deploy
+      APP_DIR: /home/gcp-deploy/smart-clinic-services
+      REPO_URL: https://github.com/${{ github.repository }}.git
+      CONFIG_SERVER_URIS: http://config.platform:9000
+      EUREKA_SERVER_URLS: http://vm-node-a.platform:9001/eureka/,http://vm-node-b.platform:9001/eureka/,http://vm-node-c.platform:9001/eureka/
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+
+      - name: Set up gcloud SDK
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Deploy to each service VM in MIG
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          INSTANCES=$(gcloud compute instance-groups managed list-instances "$MIG_NAME" \
+            --region "$REGION" \
+            --project "$PROJECT_ID" \
+            --format="value(instance)")
+
+          if [[ -z "$INSTANCES" ]]; then
+            echo "No instances found in MIG: $MIG_NAME"
+            exit 1
+          fi
+
+          for INSTANCE_URL in $INSTANCES; do
+            VM_NAME=$(echo "$INSTANCE_URL" | awk -F/ '{print $NF}')
+            VM_ZONE=$(echo "$INSTANCE_URL" | awk -F/ '{print $(NF-2)}')
+
+            echo "Deploying services to $VM_NAME ($VM_ZONE)"
+
+            gcloud compute ssh "$VM_USER@$VM_NAME" \
+              --project "$PROJECT_ID" \
+              --zone "$VM_ZONE" \
+              --command "export APP_DIR='$APP_DIR' REPO_URL='$REPO_URL' CONFIG_SERVER_URIS='$CONFIG_SERVER_URIS' EUREKA_SERVER_URLS='$EUREKA_SERVER_URLS' PATIENT_STORAGE_PROVIDER='${{ secrets.PATIENT_STORAGE_PROVIDER }}' GCS_BUCKET_NAME='${{ secrets.GCS_BUCKET_NAME }}' GCP_PROJECT_ID='$PROJECT_ID'; bash -s" <<'SCRIPT'
+            set -euo pipefail
+
+            if [[ ! -d "$APP_DIR/.git" ]]; then
+              git clone "$REPO_URL" "$APP_DIR"
+            else
+              git -C "$APP_DIR" fetch origin main
+              git -C "$APP_DIR" reset --hard origin/main
+            fi
+
+            git -C "$APP_DIR" submodule sync --recursive || true
+            git -C "$APP_DIR" submodule update --init --recursive
+
+            cd "$APP_DIR"
+            mkdir -p logs
+
+            chmod +x patient-service/mvnw doctor-service/mvnw appointment-service/mvnw
+            (cd patient-service && ./mvnw clean package -DskipTests)
+            (cd doctor-service && ./mvnw clean package -DskipTests)
+            (cd appointment-service && ./mvnw clean package -DskipTests)
+
+            export CONFIG_SERVER_URIS EUREKA_SERVER_URLS
+
+            if [[ -n "${PATIENT_STORAGE_PROVIDER:-}" ]]; then
+              export PATIENT_STORAGE_PROVIDER
+            fi
+            if [[ -n "${GCS_BUCKET_NAME:-}" ]]; then
+              export GCS_BUCKET_NAME
+            fi
+
+            pm2 delete patient-service doctor-service appointment-service >/dev/null 2>&1 || true
+            pm2 start ecosystem.services.config.js --update-env
+            pm2 save
+          SCRIPT
+          done
